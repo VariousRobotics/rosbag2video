@@ -30,7 +30,7 @@ sudo apt install python3-sensor-msgs python3-opencv ros-foxy-rosbag2-transport
 
 ## **Usage**
 
-``` bash
+```bash
 ros2bag2video.py [--fps 25] [--rate 1.0] [-o outputfile] [-v] [-s] [-t topic] bagfile1
 
 Converts image sequence(s) in ros bag file(s) to video file(s) with fixed frame rate using ffmpeg
@@ -51,11 +51,8 @@ ffmpeg needs to be installed!
 ## **Example Output**
 
 ```bash
-# Source ROS2 Humble
-source /opt/ros/humble/setup.bash
-
-# Run the script.  Rate greater than 5.0 leads to dropped frames on the test PC.
-./ros2bag2video.py --fps=25 --rate=5.0 -t /camera_node/image_raw/compressed ~/Documents/rosbag2_2023_04_19-14_44_56
+# Run the script.  Rate greater than 1.0 leads to dropped frames on the test PC.
+./ros2bag2video.py --fps=25 -t /camera_node/image_raw/compressed ~/Documents/rosbag2_2023_04_19-14_44_56
 
 
 FPS (int) =  25
