@@ -19,13 +19,15 @@
 import sys
 import cv2
 import rclpy
+import rclpy.executors
 import getopt
 import subprocess
+import threading
+import queue
 from rclpy.node import Node
 from cv_bridge import CvBridge
 
-from sensor_msgs.msg import Image
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import Image, CompressedImage
 
 try:
     from theora_image_transport.msg import Packet
@@ -33,13 +35,13 @@ except Exception:
     pass
 
 VIDEO_CONVERTER_TO_USE = "ffmpeg"
+# Sentinel value: when this is put into the queue, the image writer thread will terminate.
+SENTINEL = None
 
 
 def print_help():
     """
-    The print_help function.
-    Outputs how a user can configure use of ros2bag2video to generate the video
-    from ROS2 bag file.
+    Prints usage help.
     """
     print(
         "ros2bag2video.py [--fps 25] [--rate 1] [-o outputfile] [-v] "
@@ -47,7 +49,7 @@ def print_help():
     )
     print()
     print(
-        "Converts image sequence(s) in ros bag file(s) to video file(s)"
+        "Converts image sequence(s) in ROS bag file(s) to video file(s)"
         + " with fixed frame rate using",
         VIDEO_CONVERTER_TO_USE,
     )
@@ -68,7 +70,7 @@ def print_help():
     print(
         "        ",
         VIDEO_CONVERTER_TO_USE,
-        " will guess the format " + "according to given extension.",
+        " will guess the format according to the file extension.",
     )
     print(
         "        Compressed and raw image messages are supported with "
@@ -77,93 +79,114 @@ def print_help():
     print("--rate  (-r) You may slow down or speed up the video.")
     print("        Default is 1.0, that keeps the original speed.")
     print(
-        "-s      Shows each and every image extracted from the rosbag file"
-        + " (cv_bride is needed)."
+        "-s      Displays each and every image extracted from the ROS bag file"
+        + " (cv_bridge is needed)."
     )
     print(
-        '--topic (-t) Only the images from topic "topic" are used for the'
-        + "video output."
+        '--topic (-t) Only the images from the specified topic are used for'
+        + " video output."
     )
     print("-v      Verbose messages are displayed.")
 
 
+class ImageWriterThread(threading.Thread):
+    """
+    A thread that takes images from a queue and writes them to disk.
+    When the SENTINEL is encountered, the thread will exit.
+    """
+
+    def __init__(self, image_queue):
+        super().__init__()
+        self.image_queue = image_queue
+
+    def run(self):
+        while True:
+            item = self.image_queue.get()
+            # Exit if a SENTINEL is received.
+            if item is SENTINEL:
+                self.image_queue.task_done()
+                break
+            frame_no, img = item
+            filename = str(frame_no).zfill(4) + ".png"
+            cv2.imwrite(filename, img)
+            self.image_queue.task_done()
+
+
 class RosVideoWriter(Node):
     """
-    The RosVideoWriter class is a ROS2 node instantiated to subscribe to a
-    user-defined ROS2 topic on a user-defined ROS2 bag file.
+    A ROS2 node that extracts images from a bag file and converts them into a video.
+    The image saving process is offloaded to a separate thread to reduce load in the callback.
     """
 
     def __init__(self, args):
-        """
-        The constructor.
-        1. Initializes class attributes using user inputs and reading input
-        bag file.
-        2. Defines subscriber callback.
-        3. Plays input bag file.
-        """
         super().__init__("ros2bag2videos")
-
         self.fps = 25
         self.rate = 1.0
         self.frame_no = 1
         self.opt_out_file = "output.mp4"
         self.opt_topic = ""
         self.opt_verbose = False
-        self.pix_fmt_already_set = False
         self.bridge = CvBridge()
         self.pix_fmt = "yuv420p"
         self.msg_fmt = ""
+        self.bag_file = None
+        self.msgtype = None
+        self.count = 0
 
-        # Checks if a ROS2 bag has been specified in command line.
+        # Parse command line arguments.
         if len(args) < 2:
-            print("Please specify ROS2 bag file!")
+            print("Please specify a ROS2 bag file!")
             print_help()
             sys.exit(1)
         try:
             opt_files = self.parse_args(args[1:])
-            print("FPS (int) = ", self.fps)
-            print("Rate (float) = ", self.rate)
-            print("Topic (str) = ", self.opt_topic)
-            print("Output File (str) = ", self.opt_out_file)
-            print("Verbose (bool) = ", self.opt_verbose)
+            if len(opt_files) < 1:
+                print("Bag file not specified!")
+                sys.exit(1)
+            self.bag_file = opt_files[0]
+            print("FPS (int) =", self.fps)
+            print("Rate (float) =", self.rate)
+            print("Topic (str) =", self.opt_topic)
+            print("Output File (str) =", self.opt_out_file)
+            print("Verbose (bool) =", self.opt_verbose)
         except getopt.GetoptError:
             print_help()
             sys.exit(2)
 
-        # Params OK so start extraction.
-        self.bag_file = opt_files[0]
-        self._read_info_process = 0
-        self._play_process = 0
-        self._video_write_process = 0
-        self._file_cleanup_process = 0
+        # Retrieve bag file information.
         self._read_ros_bag_info()
-        # Set up subscriber for the image message.
-        print("AJB: subscribing to msg: ", self.msgtype, "on topic: ", self.opt_topic)
+
+        # Prepare a queue and thread for asynchronous image writing.
+        self.image_queue = queue.Queue(maxsize=1000)
+        self.writer_thread = ImageWriterThread(self.image_queue)
+        self.writer_thread.start()
+
+        # Create a subscription with an increased QoS depth for high-rate playback.
+        qos_profile = rclpy.qos.QoSProfile(depth=400)
         self.subscription = self.create_subscription(
-            self.msgtype, self.opt_topic, self.listener_callback, 10
+            self.msgtype, self.opt_topic, self.listener_callback, qos_profile
         )
+        self.get_logger().info(
+            f"Subscribed to {self.opt_topic} with msg type {self.msgtype}"
+        )
+
+        # Start ROS bag playback.
         self._play_process = self._playback_ros_bag()
 
     def _read_ros_bag_info(self):
-        print("Reading info from bag file:", self.bag_file)
-        rosbag2_info = ""
+        self.get_logger().info("Reading info from bag file: " + self.bag_file)
         with subprocess.Popen(
             ["ros2", "bag", "info", self.bag_file], stdout=subprocess.PIPE
-        ) as self._read_info_process:
-            rosbag2_info = str(
-                self._read_info_process.stdout.read(), "utf-8"
-            ).splitlines()
+        ) as proc:
+            rosbag2_info = proc.stdout.read().decode("utf-8").splitlines()
         self.msgfmt_literal, self.count = self.get_topic_info(rosbag2_info)
         self.msgtype = self.filter_image_msgs(self.msgfmt_literal)
-
-        # DEBUG
-        # print(rosbag2_info)
-        print("ROS Message name = ", self.msgfmt_literal)
-        print("Image count = ", self.count)
-        print("msgtype = ", self.msgtype)
+        self.get_logger().info(f"ROS Message name = {self.msgfmt_literal}")
+        self.get_logger().info(f"Image count = {self.count}")
+        self.get_logger().info(f"msgtype = {self.msgtype}")
 
     def _playback_ros_bag(self):
-        print("Starting ROS bag playback...")
+        self.get_logger().info("Starting ROS bag playback...")
         process = subprocess.Popen(
             [
                 "ros2",
@@ -178,19 +201,9 @@ class RosVideoWriter(Node):
         )
         return process
 
-    """
-    Parses user input from command line to get the following information.
-    1. Verbose [opt_verbose]
-    2. FPS [fps]
-    3. Rate [rate]
-    4. Output File Name [opt_out_file]
-    5. Input Topic Name [opt_topic]
-    6. Input Bag File Path Name [opt_files[0]]
-    """
-
     def parse_args(self, args):
         opts, opt_files = getopt.getopt(
-            args, "hsvr:o:t:p:", ["fps=", "rate=", "ofile=", "topic="]
+            args, "hsvr:o:t:", ["fps=", "rate=", "ofile=", "topic="]
         )
         for opt, arg in opts:
             if opt == "-h":
@@ -207,24 +220,17 @@ class RosVideoWriter(Node):
             elif opt in ("-t", "--topic"):
                 self.opt_topic = arg
             else:
-                print("opz:", opt, "arg:", arg)
+                print("Unknown option:", opt, "arg:", arg)
 
         if self.fps <= 0:
-            print("Invalid fps", self.fps)
+            self.get_logger().warn("Invalid fps provided, defaulting to 1")
             self.fps = 1
 
         if self.rate <= 0:
-            print("Invalid rate", self.rate)
+            self.get_logger().warn("Invalid rate provided, defaulting to 1")
             self.rate = 1
 
-        if self.opt_verbose:
-            print("Using ", self.fps, " FPS")
         return opt_files
-
-    """
-    Determines the ROS2 message format which RosVideoWriter node will expect to
-    receive in our subscriber callback.
-    """
 
     def filter_image_msgs(self, msgfmt_literal):
         if "sensor_msgs/msg/Image" == msgfmt_literal:
@@ -233,202 +239,109 @@ class RosVideoWriter(Node):
             return CompressedImage
         elif "theora_image_transport/msg/Packet" == msgfmt_literal:
             return Packet
-
-    """
-    Parses ROS2 message encoding to derive the following information.
-    1. pix_fmt (To be passed to ffmpeg process execution.)
-    2. msg_fmt (To be passed to cv_bridge function to convert ROS2 messages
-    to OpenCV Mat)
-    """
-
-    def get_pix_fmt(self, msg_encoding):
-        pix_fmt = "yuv420p"
-        msg_fmt = ""
-
-        print("AJB: Encoding:", msg_encoding)
-
-        try:
-            if msg_encoding.find("mono8") != -1:
-                pix_fmt = "gray"
-                msg_fmt = "bgr8"
-            elif msg_encoding.find("8UC1") != -1:
-                pix_fmt = "gray"
-                msg_fmt = "bgr8"
-            elif msg_encoding.find("bgra") != -1:
-                pix_fmt = "bgra"
-                msg_fmt = "bgr8"
-            elif msg_encoding.find("bgr8") != -1:
-                pix_fmt = "bgr24"
-                msg_fmt = "bgr8"
-            elif msg_encoding.find("bggr8") != -1:
-                pix_fmt = "bayer_bggr8"
-                msg_fmt = "bayer_bggr8"
-            elif msg_encoding.find("rggb8") != -1:
-                pix_fmt = "bayer_rggb8"
-                msg_fmt = "bayer_rggb8"
-            elif msg_encoding.find("rgb8") != -1:
-                pix_fmt = "rgb24"
-                msg_fmt = "rgb8"
-            elif msg_encoding.find("16UC1") != -1:
-                pix_fmt = "gray16le"
-                msg_fmt = "mono16"
-            else:
-                print("Unsupported encoding:", msg_encoding)
-                self.exit(1)
-
-        except AttributeError:
-            # maybe theora packet
-            # theora not supported
-            print(
-                "Could not handle this format."
-                + " Maybe thoera packet? theora is not supported."
-            )
-            self.exit(1)
-
-        print("pix_fmt:", pix_fmt, "msg_fmt", msg_fmt)
-        return pix_fmt, msg_fmt
-
-    """
-    Parses 'ros2 bag info input_bag/' terminal output to get the following
-    information:
-    1. ROS2 Message Type (To be used in constructor to define subscriber
-    callback.)
-    2. ROS2 Message Frame Count (To be used in subscriber callback to track
-    progress.)
-    3. ROS2 Bag Serialization Format (Not used.)
-
-    Returns only the first two info.
-    """
+        else:
+            self.get_logger().error("Unsupported message type: " + msgfmt_literal)
+            sys.exit(1)
 
     def get_topic_info(self, rosbag2_info):
         msgtype = ""
         count = 0
-        # serialtype = ''  # Unused
-
         for line in rosbag2_info:
-            # print("gti: line:", line)
             if self.opt_topic in line:
-                parse_line = line.split()
-                for word_index in range(0, len(parse_line)):
-                    if "Type:" in parse_line[word_index]:
-                        msgtype = parse_line[word_index + 1]
-                    if "Count:" in parse_line[word_index]:
-                        count = int(parse_line[word_index + 1])
-                    # if 'Serialization' in parse_line[word_index]:
-                    #     serialtype = parse_line[word_index+2]
-
-        # print("Returning msgtype:", msgtype, "count:", count)
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.startswith("Type:"):
+                        if i + 1 < len(parts):
+                            msgtype = parts[i + 1]
+                    if part.startswith("Count:"):
+                        if i + 1 < len(parts):
+                            try:
+                                count = int(parts[i + 1])
+                            except ValueError:
+                                count = 0
         return msgtype, count
 
-    """
-    The Subscriber Callback.
-    1. Receives images from running ROS2 bag file.
-    2. Get pix_fmt info for ffmpeg process execution.
-    3. Manually converts 16UC1 color encoding to mono16 to avoid cv_bridge
-    conversion error.
-    4. Converts ROS2 image message to OpenCV Mat object.
-    5. Writes individual frame out to file.
-    6. Uses ffmpeg to stitch all frames into a video at user-defined
-    configuration.
-    7. Removes all individual frames.
-    """
-
     def listener_callback(self, msg):
-        self.get_logger().info("Image Received [%i/%i]" % (self.frame_no, self.count))
+        # Log the receipt of the image.
+        self.get_logger().info(
+            f"Image Received [{self.frame_no}/{self.count}]"
+        )
 
-        # Original code.  Doesn't work for compressed images.
-        # if not self.pix_fmt_already_set:
-        #     self.pix_fmt, self.msg_fmt = self.get_pix_fmt(msg.encoding)
-        #     self.pix_fmt_already_set = True
-        #
-        # if msg.encoding.find("16UC1") != -1:
-        #     msg.encoding = "mono16"
-
-        # HACK to get this working...
+        # For simplicity, we fix the pixel format (yuv420p) and message format (rgb8)
         self.pix_fmt = "yuv420p"
-        self.msg_fmt = "rgb8"
-        # print("AJB: msg: ", msg)
+        self.msg_fmt = "bgra8"
 
-        if self.msgtype == CompressedImage:
-            img = self.bridge.compressed_imgmsg_to_cv2(msg, self.msg_fmt)
-        elif self.msgtype == Image:
-            img = self.bridge.imgmsg_to_cv2(msg, self.msg_fmt)
-        else:
-            print("Unsupported message type:", self.msgtype)
-            sys.exit(1)
+        # Convert the ROS image message to an OpenCV image using cv_bridge.
+        try:
+            if self.msgtype == CompressedImage:
+                img = self.bridge.compressed_imgmsg_to_cv2(msg, self.msg_fmt)
+            elif self.msgtype == Image:
+                img = self.bridge.imgmsg_to_cv2(msg, self.msg_fmt)
+            else:
+                self.get_logger().error("Unsupported message type.")
+                sys.exit(1)
+        except Exception as e:
+            self.get_logger().error("Error converting image: " + str(e))
+            return
 
-        filename = str(self.frame_no).zfill(4) + ".png"
-        cv2.imwrite(filename, img)
+        # Immediately enqueue the image to avoid blocking in the callback.
+        self.image_queue.put((self.frame_no, img))
+        self.frame_no += 1
 
-        """
-        Once the last frame is reached, combine all individual image frames
-        together to create the video. Remove all individual image frames and
-        kill program once done.
-        Otherwise, continue incrementing frame count.
-        """
-        if self.frame_no == self.count - 1:
-            print("Writing to output file, " + self.opt_out_file)
-            self._video_write_process = subprocess.Popen(
-                [
-                    VIDEO_CONVERTER_TO_USE,
-                    "-framerate",
-                    str(self.fps),
-                    "-pattern_type",
-                    "glob",
-                    "-i",
-                    "*.png",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    self.pix_fmt,
-                    self.opt_out_file,
-                    "-y",
-                ]
-            )
-            self._video_write_process.communicate()
-            self._video_write_process.wait()
-            # Now remove all the jpeg image files.
-            args = ("rm ", "*.png")
-            self._file_cleanup_process = subprocess.call("%s %s" % args, shell=True)
-            print("Complete.")
+        # When the last frame is received, signal the writer thread to finish.
+        if self.frame_no > self.count:
+            self.image_queue.put(SENTINEL)
+            # Wait until all images in the queue are processed.
+            self.image_queue.join()
+            self.writer_thread.join()
+
+            self.get_logger().info("All images written, starting video creation...")
+
+            # Use ffmpeg to create the video from the saved images.
+            ffmpeg_cmd = [
+                VIDEO_CONVERTER_TO_USE,
+                "-framerate", str(self.fps),
+                "-pattern_type", "glob",
+                "-i", "*.png",
+                "-c:v", "libx264",
+                "-pix_fmt", self.pix_fmt,
+                self.opt_out_file,
+                "-y",
+            ]
+            try:
+                subprocess.run(ffmpeg_cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                self.get_logger().error("ffmpeg failed: " + str(e))
+                sys.exit(1)
+            # Remove individual image files.
+            subprocess.call("rm *.png", shell=True)
+            self.get_logger().info("Video creation complete. Exiting.")
             sys.exit(0)
-        else:
-            self.frame_no = self.frame_no + 1
 
     def exit(self, value):
-        # Close any running processes.
-        # FIXME AJB Tidy this up!
-        if self._read_info_process:
-            self._read_info_process.kill()
-            self._read_info_process.join()
         if self._play_process:
             self._play_process.kill()
-            self._play_process.join()
-        if self._video_write_process:
-            self._video_write_process.kill()
-            self._video_write_process.join()
-        if self._file_cleanup_process:
-            self._file_cleanup_process.kill()
-            self._file_cleanup_process.join()
-        if value != 0:
-            sys.exit(value)
+        sys.exit(value)
 
 
 def main(args=None):
     """
     The main function.
-    Starts ros2bag2videos ROS2 node and spins it.
+    Initializes the ROS2 node and spins it using a multi-threaded executor.
     """
     rclpy.init(args=args)
-    videowriter = RosVideoWriter(args)
+    videowriter = RosVideoWriter(sys.argv)
     try:
-        rclpy.spin(videowriter)
+        executor = rclpy.executors.MultiThreadedExecutor()
+        executor.add_node(videowriter)
+        executor.spin()
     except KeyboardInterrupt:
-        print("KeyboardInterrupt received, shutting down gracefully.")
+        videowriter.get_logger().info(
+            "KeyboardInterrupt received, shutting down gracefully."
+        )
     finally:
         videowriter.destroy_node()
-        rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
