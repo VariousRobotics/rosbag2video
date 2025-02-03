@@ -173,10 +173,7 @@ class RosVideoWriter(Node):
                 "-r",
                 str(self.rate),
                 "--topics",
-                # HACK AJB Use this for SkateBot
-                # "/camera_node/image_raw/compressed",
-                # HACK AJB Use this for joeys.
-                "/je7c/camera/compressed",
+                self.opt_topic,
             ]
         )
         return process
@@ -348,11 +345,18 @@ class RosVideoWriter(Node):
         #     msg.encoding = "mono16"
 
         # HACK to get this working...
-        self.pix_fmt = "rgb24"
+        self.pix_fmt = "yuv420p"
         self.msg_fmt = "rgb8"
         # print("AJB: msg: ", msg)
 
-        img = self.bridge.compressed_imgmsg_to_cv2(msg, self.msg_fmt)
+        if self.msgtype == CompressedImage:
+            img = self.bridge.compressed_imgmsg_to_cv2(msg, self.msg_fmt)
+        elif self.msgtype == Image:
+            img = self.bridge.imgmsg_to_cv2(msg, self.msg_fmt)
+        else:
+            print("Unsupported message type:", self.msgtype)
+            sys.exit(1)
+
         filename = str(self.frame_no).zfill(4) + ".png"
         cv2.imwrite(filename, img)
 
@@ -362,7 +366,7 @@ class RosVideoWriter(Node):
         kill program once done.
         Otherwise, continue incrementing frame count.
         """
-        if self.frame_no == self.count:
+        if self.frame_no == self.count - 1:
             print("Writing to output file, " + self.opt_out_file)
             self._video_write_process = subprocess.Popen(
                 [
@@ -382,7 +386,7 @@ class RosVideoWriter(Node):
                 ]
             )
             self._video_write_process.communicate()
-            self._video_write_process.join()
+            self._video_write_process.wait()
             # Now remove all the jpeg image files.
             args = ("rm ", "*.png")
             self._file_cleanup_process = subprocess.call("%s %s" % args, shell=True)
@@ -416,14 +420,14 @@ def main(args=None):
     Starts ros2bag2videos ROS2 node and spins it.
     """
     rclpy.init(args=args)
-
     videowriter = RosVideoWriter(args)
-
-    rclpy.spin(videowriter)
-
-    videowriter.exit(0)
-    videowriter.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(videowriter)
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received, shutting down gracefully.")
+    finally:
+        videowriter.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
