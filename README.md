@@ -74,3 +74,8 @@ bag_file =  rosbag2_2023_04_19-14_44_56/
 Writing to output file, output.mp4
 
 ```
+
+## Important Points
+
+- After retrieving the last image, it may take some time before video conversion starts, so please be patient.
+- To exit the node, use Ctrl + C.
